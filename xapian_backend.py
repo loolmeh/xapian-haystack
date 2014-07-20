@@ -72,6 +72,23 @@ INTEGER_FORMAT = '%012d'
 # texts with positional information
 TERMPOS_DISTANCE = 100
 
+# will be replaced by a patch to haystack I hope
+STEMMERS = getattr(settings, 'STEMMERS', {})
+
+def stem(text, lang):
+    stemmer = STEMMERS.get(lang)
+
+    if not stemmer:
+        return ''
+
+    text_stemmed = []
+    for term in text.split(' '):
+        term = stemmer.stem(term)
+        text_stemmed.append(term)
+    text_stemmed = ' '.join(text_stemmed)
+
+    return text_stemmed
+
 class InvalidIndexError(HaystackError):
     """Raised when an index can not be opened."""
     pass
@@ -185,7 +202,6 @@ class XapianSearchBackend(BaseSearchBackend):
             os.makedirs(self.path)
 
         self.flags = connection_options.get('FLAGS', DEFAULT_XAPIAN_FLAGS)
-        self.language = getattr(settings, 'HAYSTACK_XAPIAN_LANGUAGE', None)
 
         # these 4 attributes are caches populated in `build_schema`
         # they are checked in `_update_cache`
@@ -267,37 +283,10 @@ class XapianSearchBackend(BaseSearchBackend):
         try:
             term_generator = xapian.TermGenerator()
             term_generator.set_database(database)
-            if self.language:
-                term_generator.set_stemmer(xapian.Stem(self.language))
             if self.include_spelling is True:
                 term_generator.set_flags(xapian.TermGenerator.FLAG_SPELLING)
 
-            def _add_text(termpos, text, weight, prefix=''):
-                """
-                indexes text appending 2 extra terms
-                to identify beginning and ending of the text.
-                """
-                term_generator.set_termpos(termpos)
-
-                start_term = '%s^' % prefix
-                end_term = '%s$' % prefix
-                # add begin
-                document.add_posting(start_term, termpos, weight)
-                # add text
-                if self.language:
-                    term_generator.index_text(text, weight, prefix)
-                termpos = term_generator.get_termpos()
-                # add ending
-                termpos += 1
-                document.add_posting(end_term, termpos, weight)
-
-                # increase termpos
-                term_generator.set_termpos(termpos)
-                term_generator.increase_termpos(TERMPOS_DISTANCE)
-
-                return term_generator.get_termpos()
-
-            def _add_literal_text(termpos, text, weight, prefix=''):
+            def _add_text(termpos, text, weight, prefix='', term_xtraprefix=''):
                 """
                 Adds sentence to the document with positional information
                 but without processing.
@@ -306,7 +295,7 @@ class XapianSearchBackend(BaseSearchBackend):
                 """
                 text = '^ %s $' % text
                 for word in text.split():
-                    term = '%s%s' % (prefix, word)
+                    term = '%s%s%s' % (term_xtraprefix, prefix, word)
                     document.add_posting(term, termpos, weight)
                     termpos += 1
                 termpos += TERMPOS_DISTANCE
@@ -317,10 +306,12 @@ class XapianSearchBackend(BaseSearchBackend):
                 Adds text to the document with positional information
                 and processing (e.g. stemming).
                 """
+                lang = self.language
+                if lang:
+                    termpos = _add_text(termpos, stem(text, lang), weight, prefix=prefix, term_xtraprefix='Z')
+                    termpos = _add_text(termpos, stem(text, lang), weight, prefix='', term_xtraprefix='Z')
                 termpos = _add_text(termpos, text, weight, prefix=prefix)
                 termpos = _add_text(termpos, text, weight, prefix='')
-                termpos = _add_literal_text(termpos, text, weight, prefix=prefix)
-                termpos = _add_literal_text(termpos, text, weight, prefix='')
                 return termpos
 
             for obj in iterable:
@@ -419,7 +410,6 @@ class XapianSearchBackend(BaseSearchBackend):
                 # add the id of the document
                 document_id = TERM_PREFIXES['id'] + get_identifier(obj)
                 document.add_term(document_id)
-
                 # finally, replace or add the document to the database
                 database.replace_document(document_id, document)
 
@@ -757,9 +747,6 @@ class XapianSearchBackend(BaseSearchBackend):
 
         qp = xapian.QueryParser()
         qp.set_database(self._database())
-        if self.language:
-            qp.set_stemmer(xapian.Stem(self.language))
-            qp.set_stemming_strategy(xapian.QueryParser.STEM_SOME)
         qp.set_default_op(XAPIAN_OPTS[DEFAULT_OPERATOR])
         qp.add_boolean_prefix('django_ct', TERM_PREFIXES['django_ct'])
 
@@ -1387,7 +1374,7 @@ class XapianSearchQuery(BaseSearchQuery):
         query = xapian.Query(xapian.Query.OP_PHRASE, term_list)
         return query
 
-    def _term_query(self, term, field_name, field_type, stemmed=True):
+    def _term_query(self, term, field_name, field_type, stemmed=None):
         """
         Constructs a query of a single term.
 
@@ -1395,6 +1382,7 @@ class XapianSearchQuery(BaseSearchQuery):
         If exact is `True`, the search is restricted to boolean matches.
         """
         constructor = '{prefix}{term}'
+        stemmed = stemmed if stemmed is not None else self.should_stem
 
         # construct the prefix to be used.
         prefix = ''
@@ -1423,9 +1411,7 @@ class XapianSearchQuery(BaseSearchQuery):
 
         unstemmed_term = constructor.format(prefix=prefix, term=term)
         if stemmed:
-            stem = xapian.Stem(self.backend.language)
-            stemmed_term = 'Z' + constructor.format(prefix=prefix, term=stem(term).decode('utf-8'))
-
+            stemmed_term = 'Z' + constructor.format(prefix=prefix, term=stem(term, self.language))
             return xapian.Query(xapian.Query.OP_OR,
                                 xapian.Query(stemmed_term),
                                 xapian.Query(unstemmed_term)
